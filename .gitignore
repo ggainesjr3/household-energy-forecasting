@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
 # dependencies
@@ -25,3 +26,11 @@ node_modules/
 venv/
 .env
 __pycache__/
+=======
+venv/
+__pycache__/
+*.csv
+*.txt
+.env
+serviceAccountKey.json
+>>>>>>> df25bbd (Initial Commit: Energy Forecasting with 0.07 RMSE XGBoost)
