@@ -1,74 +1,65 @@
 import pandas as pd
 import numpy as np
-import xgboost as xgb
-from sklearn.metrics import mean_squared_error
-import firebase_admin
-from firebase_admin import credentials, firestore
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-# 1. FIREBASE INITIALIZATION
-if not firebase_admin._apps:
-    cred = credentials.Certificate('/home/gary/household-energy-forecasting/serviceAccountKey.json')
-    firebase_admin.initialize_app(cred)
-db = firestore.client()
+def create_features(df):
+    df = df.copy()
+    
+    # 1. Circular Time Encoding (The "Clock" Fix)
+    df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
+    
+    # 2. Weekend Logic
+    df['is_weekend'] = df.index.dayofweek.isin([5, 6]).astype(int)
+    
+    # 3. Enhanced Lags (Short and Long Term)
+    df['target'] = df['Global_active_power']
+    df['lag_1h'] = df['target'].shift(1)
+    df['lag_2h'] = df['target'].shift(2)
+    df['lag_24h'] = df['target'].shift(24)
+    
+    # 4. Rolling Volatility (The "Bouncer" Logic - watching for trouble)
+    df['rolling_std_3h'] = df['target'].rolling(window=3).std()
+    
+    return df.dropna()
 
-# 2. LOAD DATA
-data_path = '/home/gary/household-energy-forecasting/data/household_power_consumption.txt'
-data = pd.read_csv(data_path, sep=';', low_memory=False, na_values=['?'])
-data = data.rename(columns={'Global_active_power': 'actual'})
-data['actual'] = pd.to_numeric(data['actual'])
-data = data.dropna(subset=['actual'])
-data = data.tail(10000).reset_index(drop=True)
+if __name__ == "__main__":
+    PATH = 'data/household_power_consumption.txt'
+    try:
+        # Load and resample
+        df_raw = pd.read_csv(PATH, sep=';', parse_dates={'dt': ['Date', 'Time']}, 
+                             na_values=['?'], index_col='dt', low_memory=False)
+        df_raw = df_raw.ffill().fillna(df_raw.median())
+        hourly = df_raw.resample('H').mean()
+        
+        df = create_features(hourly)
 
-# 3. FEATURE ENGINEERING (Baseline & Rolling)
-data['baseline_pred'] = data['actual'].shift(24)
-data['rolling_mean_3h'] = data['actual'].rolling(window=3).mean()
-data['rolling_std_3h'] = data['actual'].rolling(window=3).std()
+        # Chronological Split
+        split_idx = int(len(df) * 0.8)
+        train, test = df.iloc[:split_idx], df.iloc[split_idx:]
 
-# 4. PREPROCESSING
-data = data.dropna().reset_index(drop=True)
+        cols = ['hour_sin', 'hour_cos', 'is_weekend', 'lag_1h', 'lag_2h', 'lag_24h', 'rolling_std_3h']
+        
+        # XGBoost with refined parameters
+        model = XGBRegressor(
+            n_estimators=500,
+            learning_rate=0.03,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            n_jobs=-1
+        )
+        
+        print("🚀 Training Refined Energy Engine...")
+        model.fit(train[cols], train['target'])
 
-# Generate Time Features
-data['hour'] = pd.to_datetime(data['Time']).dt.hour
-data['day_of_week'] = pd.to_datetime(data['Date'], dayfirst=True).dt.dayofweek
+        preds = model.predict(test[cols])
+        mae = mean_absolute_error(test['target'], preds)
+        rmse = np.sqrt(mean_squared_error(test['target'], preds))
 
-# Updated Feature Set
-X = data[['hour', 'day_of_week', 'baseline_pred', 'rolling_mean_3h', 'rolling_std_3h']]
-y = data['actual']
+        print(f"\n✅ REFINED PERFORMANCE:")
+        print(f"MAE: {mae:.4f} kW | RMSE: {rmse:.4f} kW")
 
-# Split
-split_idx = len(data) - 48
-X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-
-# 5. MODEL TRAINING
-model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100)
-model.fit(X_train, y_train)
-xg_preds = model.predict(X_test)
-
-# 6. METRICS
-xg_rmse = np.sqrt(mean_squared_error(y_test, xg_preds))
-base_rmse = np.sqrt(mean_squared_error(y_test, X_test['baseline_pred']))
-
-print(f"XGBoost RMSE: {xg_rmse:.4f}")
-print(f"Baseline RMSE: {base_rmse:.4f}")
-
-# 7. FIRESTORE PAYLOAD
-forecast_data = []
-for i in range(len(y_test)):
-    forecast_data.append({
-        "hour": int(X_test.iloc[i]['hour']),
-        "actual": float(y_test.iloc[i]),
-        "predicted": float(xg_preds[i]),
-        "baseline": float(X_test.iloc[i]['baseline_pred'])
-    })
-
-# Update Firestore
-doc_ref = db.collection('forecasts').document('latest')
-doc_ref.set({
-    'data': forecast_data,
-    'xg_rmse': float(xg_rmse),
-    'base_rmse': float(base_rmse),
-    'updatedAt': firestore.SERVER_TIMESTAMP
-})
-
-print("Success: Pipeline updated with Rolling Statistics.")
+    except Exception as e:
+        print(f"❌ Error: {e}")
